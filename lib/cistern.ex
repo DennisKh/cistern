@@ -49,7 +49,7 @@ defmodule Cistern do
   """
   alias Cistern.Redis.Pool
 
-  @type value :: Redix.Protocol.redis_value() | boolean()
+  @type value :: Redix.Protocol.redis_value() | boolean() | integer()
   @type result :: {:ok, value()} | {:error, atom() | Redix.Error.t()}
 
   @doc """
@@ -101,6 +101,12 @@ defmodule Cistern do
     * string number to an integer, ex: "123" to 123
     * regular strings will remain unchanged
 
+  ## Options
+
+    * `:coerce` - When `false`, the raw string is returned without type
+      coercion (e.g. `"01001"` stays `"01001"` instead of becoming `1001`).
+      Defaults to `true` for backward compatibility.
+
   ## Examples
 
       iex> Cistern.set_many([{"foo", "bar"}, {"boo", "true"}, {"baz", "1"}])
@@ -111,16 +117,18 @@ defmodule Cistern do
       {:ok, true}
       iex> Cistern.get("baz")
       {:ok, 1}
+      iex> Cistern.get("baz", coerce: false)
+      {:ok, "1"}
       iex> Cistern.get("some")
       {:ok, nil}
   """
-  @spec get(key :: any()) :: result()
-  def get(key) do
+  @spec get(key :: any(), opts :: Keyword.t()) :: result()
+  def get(key, opts \\ []) do
     key = validate_key(key)
 
     ["GET", key]
     |> command()
-    |> translate()
+    |> translate(opts)
   end
 
   @doc """
@@ -175,8 +183,12 @@ defmodule Cistern do
     key = validate_key(key)
 
     case Keyword.fetch(opts, :ttl) do
-      {:ok, ttl} ->
+      {:ok, ttl} when is_integer(ttl) and ttl > 0 ->
         command(["SET", key, value, "PX", ttl])
+
+      {:ok, ttl} ->
+        raise ArgumentError,
+              "ttl must be a positive integer (milliseconds), got: #{inspect(ttl)}"
 
       _ ->
         command(["SET", key, value])
@@ -223,27 +235,22 @@ defmodule Cistern do
       iex> Cistern.set_many([])
       :ok
   """
-  @spec set_many(Keyword.t(), opts :: Keyword.t()) :: :ok
+  @spec set_many(Keyword.t(), opts :: Keyword.t()) :: :ok | {:error, term()}
   def set_many(kv_list, opts \\ []) do
-    %{kv: validated_kv_list, keys: validated_keys} =
-      Enum.reduce(kv_list, %{keys: [], kv: []}, fn {key, value}, acc ->
-        validated_key = validate_key(key)
-        kv = [validated_key, value]
+    # Dedup by key with last-write-wins. `Map.new/1` keeps the last value for a
+    # repeated key, and the resulting pairs are flattened once into MSET args.
+    deduped_pairs =
+      kv_list
+      |> Enum.map(fn {key, value} -> {validate_key(key), value} end)
+      |> Map.new()
+      |> Enum.to_list()
 
-        acc
-        |> Map.put(:keys, [validated_key | acc.keys])
-        |> Map.put(:kv, [kv | acc.kv])
-      end)
+    flattened_kv_list = Enum.flat_map(deduped_pairs, fn {key, value} -> [key, value] end)
+    validated_keys = Enum.map(deduped_pairs, fn {key, _value} -> key end)
 
-    flattened_kv_list =
-      validated_kv_list
-      |> Enum.uniq()
-      |> List.flatten()
-
-    do_set_many(flattened_kv_list)
-
-    maybe_set_ttl(validated_keys, opts)
-    :ok
+    with :ok <- do_set_many(flattened_kv_list) do
+      maybe_set_ttl(validated_keys, opts)
+    end
   end
 
   @doc """
@@ -363,9 +370,10 @@ defmodule Cistern do
   defp do_set_many([]), do: :ok
 
   defp do_set_many(flattened_kv_list) do
-    {:ok, _} =
-      ["MSET" | flattened_kv_list]
-      |> command()
+    case command(["MSET" | flattened_kv_list]) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp maybe_set_ttl([], _opts), do: :ok
@@ -379,8 +387,10 @@ defmodule Cistern do
           ["PEXPIRE", validated_key, ttl]
         end)
         |> pipeline()
-
-        :ok
+        |> case do
+          {:ok, _results} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
 
       _ ->
         :ok
@@ -403,15 +413,24 @@ defmodule Cistern do
   defp validate_key(key) when is_binary(key), do: key
 
   defp validate_key(key) when is_list(key) do
-    key
-    |> Enum.filter(&is_binary/1)
-    |> IO.iodata_to_binary()
+    # Stringify every element (not just binaries) so integers and other terms
+    # are preserved. Filtering them out would silently drop parts of the key
+    # (e.g. `["prefix:", 42]` -> `"prefix:"`), causing key collisions.
+    Enum.map_join(key, "", &to_string/1)
   end
 
   defp validate_key(key), do: to_string(key)
 
-  defp translate({:ok, value}), do: {:ok, do_translate(value)}
-  defp translate(result), do: result
+  defp translate({:ok, value}, opts), do: {:ok, maybe_translate(value, opts)}
+  defp translate(result, _opts), do: result
+
+  defp maybe_translate(value, opts) do
+    if Keyword.get(opts, :coerce, true) do
+      do_translate(value)
+    else
+      value
+    end
+  end
 
   defp translate_many({:ok, list}) do
     {:ok, Enum.map(list, &do_translate/1)}

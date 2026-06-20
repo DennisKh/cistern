@@ -11,6 +11,7 @@ defmodule Cistern.Redis.Client do
   end
 
   @impl true
+  @spec init(opts :: keyword()) :: {:ok, pid()} | {:error, term()} | :ignore
   def init(_opts) do
     config = Application.get_all_env(:cistern)
     host = Keyword.fetch!(config, :host)
@@ -27,10 +28,15 @@ defmodule Cistern.Redis.Client do
 
   @doc false
   @impl true
-  def handle_call({command, args, opts}, _from, conn) do
-    Logger.debug("Execute Redix function `:#{command}` with Redis command #{inspect(args)}",
-      ansi_color: :green
-    )
+  @spec handle_call({atom(), list(), keyword()}, GenServer.from(), conn :: term()) ::
+          {:reply, term(), term()}
+  def handle_call({command, args, opts}, _from, conn)
+      when command in [:command, :pipeline, :noreply_pipeline] do
+    if Application.get_env(:cistern, :debug_commands, false) do
+      Logger.debug("Execute Redix function `:#{command}` with Redis command #{inspect(args)}",
+        ansi_color: :green
+      )
+    end
 
     {:reply, apply(@redis_module, command, [conn, args, opts]), conn}
   end
