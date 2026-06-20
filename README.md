@@ -2,6 +2,8 @@
 
 An Elixir library that wraps [Redix](https://github.com/whatyouhide/redix) with a [Poolboy](https://github.com/devinus/poolboy)-managed connection pool, providing a simple, typed API for common Redis operations.
 
+Available on [Hex](https://hex.pm/packages/cistern).
+
 ## Features
 
 - Connection pooling via Poolboy (configurable size and overflow)
