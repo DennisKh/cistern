@@ -4,8 +4,25 @@ defmodule RedixMock do
   """
 
   def start_link(_any) do
-    Registry.start_link(keys: :unique, name: RedixMock.Registry)
+    case Registry.start_link(keys: :unique, name: RedixMock.Registry) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
+
     {:ok, :conn}
+  end
+
+  @doc """
+  Removes all mock state so it cannot leak between tests. Call from an ExUnit
+  `setup` block. Stops every registered key Agent and clears the registry.
+  """
+  def reset do
+    for {_key, pid, _value} <-
+          Registry.select(RedixMock.Registry, [{{:"$1", :"$2", :"$3"}, [], [:"$$"]}]) do
+      if Process.alive?(pid), do: Agent.stop(pid)
+    end
+
+    :ok
   end
 
   def command(_conn, ["SET", key, value], _opts) do
@@ -29,13 +46,21 @@ defmodule RedixMock do
   end
 
   def command(_conn, ["MSET" | commands], _opts) do
-    commands
-    |> Enum.chunk_every(2)
-    |> Enum.each(fn attrs ->
-      command(:conn, ["SET" | attrs], [])
-    end)
+    # Real Redis rejects an MSET with an odd number of arguments. Surfacing the
+    # same error here keeps a malformed pair list (e.g. a duplicated field that
+    # throws off pairing) from silently "passing" in tests.
+    if rem(length(commands), 2) != 0 do
+      {:error, %Redix.Error{message: "ERR wrong number of arguments for 'mset' command"}}
+    else
+      # Apply pairs left-to-right, matching Redis last-write-wins semantics.
+      commands
+      |> Enum.chunk_every(2)
+      |> Enum.each(fn attrs ->
+        command(:conn, ["SET" | attrs], [])
+      end)
 
-    {:ok, "OK"}
+      {:ok, "OK"}
+    end
   end
 
   def command(_conn, ["GET", key], _opts) do
@@ -101,13 +126,21 @@ defmodule RedixMock do
   end
 
   def pipeline(_conn, commands, _opts) do
-    results =
-      Enum.map(commands, fn cmd ->
-        {:ok, result} = command(:conn, cmd, [])
-        result
-      end)
+    # Tests can force a pipeline failure (e.g. a failing PEXPIRE in set_many's
+    # TTL step) by setting `:cistern, :mock_pipeline_error`.
+    case Application.get_env(:cistern, :mock_pipeline_error) do
+      nil ->
+        results =
+          Enum.map(commands, fn cmd ->
+            {:ok, result} = command(:conn, cmd, [])
+            result
+          end)
 
-    {:ok, results}
+        {:ok, results}
+
+      reason ->
+        {:error, reason}
+    end
   end
 
   defp ensure_agent(key, value \\ nil) do

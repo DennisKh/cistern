@@ -7,7 +7,7 @@ Available on [Hex](https://hex.pm/packages/cistern).
 ## Features
 
 - Connection pooling via Poolboy (configurable size and overflow)
-- Automatic type coercion on reads: `"true"`/`"false"` → `boolean`, numeric strings → `integer`
+- Type coercion on reads (configurable, on by default): `"true"`/`"false"` → `boolean`, numeric strings → `integer`
 - High-level helpers: `get`, `set` (with optional TTL), `multiple`, `set_many`, `delete`, `delete_many`, `increment`
 - Low-level escape hatches: `command/2` and `pipeline/2` for arbitrary Redis commands
 - Fire-and-forget `noreply_pipeline/2` for write-heavy workloads
@@ -46,7 +46,37 @@ config :cistern,
   pool_max_overflow: 5,   # extra connections allowed under load
   pool_timeout: 5_000,    # ms to wait for a free connection
   sync_connect: true,
-  exit_on_disconnection: true
+  exit_on_disconnection: true,
+  coerce: true            # global read coercion (default); override per call with `coerce:`
+```
+
+### Read coercion
+
+On reads, `get/2` and `multiple/2` coerce values by default (`"true"`/`"false"`
+→ `boolean`, numeric strings → `integer`). Control it at two levels:
+
+- **Globally** via `config :cistern, coerce: false` — e.g. to keep zero-padded
+  codes or ids intact application-wide.
+- **Per call** via the `coerce:` option, which overrides the global setting:
+  `Cistern.get("zip_key", coerce: false)`.
+
+The resolution order is: per-call opt → global config → `true`.
+
+### Runtime configuration (production)
+
+For production it's common to read connection settings from environment
+variables at boot via `config/runtime.exs`:
+
+```elixir
+import Config
+
+if config_env() == :prod do
+  config :cistern,
+    host: System.fetch_env!("REDIS_HOST"),
+    port: String.to_integer(System.get_env("REDIS_PORT", "6379")),
+    password: System.get_env("REDIS_PASSWORD", ""),
+    pool_size: String.to_integer(System.get_env("REDIS_POOL_SIZE", "10"))
+end
 ```
 
 ## Usage
@@ -77,18 +107,22 @@ Or start manually:
 # Store with a TTL (milliseconds)
 {:ok, "bar"} = Cistern.set("foo", "bar", ttl: 10_000)
 
-# Retrieve — strings are coerced to boolean or integer when possible
+# Retrieve — strings are coerced to boolean or integer by default
 {:ok, "bar"}  = Cistern.get("foo")
 {:ok, true}   = Cistern.get("flag_key")   # stored as "true"
 {:ok, 42}     = Cistern.get("count_key")  # stored as "42"
 {:ok, nil}    = Cistern.get("missing")
 
+# Opt out of coercion to keep the raw string (e.g. zero-padded codes)
+{:ok, "01001"} = Cistern.get("zip_key", coerce: false)  # stored as "01001"
+
 # Bulk write
 :ok = Cistern.set_many([{"foo", "bar"}, {"count", 1}])
 :ok = Cistern.set_many([{"a", 1}, {"b", 2}], ttl: 60_000)
 
-# Bulk read
-{:ok, ["bar", 1]} = Cistern.multiple(["foo", "count"])
+# Bulk read — coercion applies here too, and is overridable the same way
+{:ok, ["bar", 1]}     = Cistern.multiple(["foo", "count"])
+{:ok, ["bar", "1"]}   = Cistern.multiple(["foo", "count"], coerce: false)
 
 # Atomic increment
 {:ok, 2} = Cistern.increment("count")
@@ -100,10 +134,12 @@ Or start manually:
 
 ### Iodata keys
 
-Keys can be iodata lists — they are joined into a single binary before being sent to Redis:
+Keys can be iodata lists — they are joined into a single binary before being
+sent to Redis. Non-binary elements (e.g. integer ids) are stringified and kept,
+so `["user:", 1]` and `["user:", 2]` produce distinct keys:
 
 ```elixir
-key = ["user:", user_id]
+key = ["user:", user_id]   # user_id may be a binary or an integer
 Cistern.set(key, data)
 Cistern.get(key)
 Cistern.delete(key)

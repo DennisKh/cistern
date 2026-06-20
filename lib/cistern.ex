@@ -25,7 +25,8 @@ defmodule Cistern do
         pool_max_overflow: 5,   # extra connections allowed under load
         pool_timeout: 5_000,    # ms to wait for a free connection
         sync_connect: true,
-        exit_on_disconnection: true
+        exit_on_disconnection: true,
+        coerce: true            # global read coercion; override per call with `coerce:`
 
   ## Starting under a supervision tree
 
@@ -49,7 +50,7 @@ defmodule Cistern do
   """
   alias Cistern.Redis.Pool
 
-  @type value :: Redix.Protocol.redis_value() | boolean()
+  @type value :: Redix.Protocol.redis_value() | boolean() | integer()
   @type result :: {:ok, value()} | {:error, atom() | Redix.Error.t()}
 
   @doc """
@@ -101,6 +102,13 @@ defmodule Cistern do
     * string number to an integer, ex: "123" to 123
     * regular strings will remain unchanged
 
+  ## Options
+
+    * `:coerce` - When `false`, the raw string is returned without type
+      coercion (e.g. `"01001"` stays `"01001"` instead of becoming `1001`).
+      Overrides the global `config :cistern, coerce: <bool>` for this call.
+      Defaults to the global config, or `true` if unset.
+
   ## Examples
 
       iex> Cistern.set_many([{"foo", "bar"}, {"boo", "true"}, {"baz", "1"}])
@@ -111,35 +119,47 @@ defmodule Cistern do
       {:ok, true}
       iex> Cistern.get("baz")
       {:ok, 1}
+      iex> Cistern.get("baz", coerce: false)
+      {:ok, "1"}
       iex> Cistern.get("some")
       {:ok, nil}
   """
-  @spec get(key :: any()) :: result()
-  def get(key) do
+  @spec get(key :: any(), opts :: Keyword.t()) :: result()
+  def get(key, opts \\ []) do
     key = validate_key(key)
 
     ["GET", key]
     |> command()
-    |> translate()
+    |> translate(opts)
   end
 
   @doc """
   Returns multiple cached values by a list of keys. For every key that does not hold a string value
   or does not exist,the special value `nil` is returned.
 
+  ## Options
+
+    * `:coerce` - When `false`, each raw string is returned without type
+      coercion (e.g. `"01001"` stays `"01001"` instead of becoming `1001`).
+      Overrides the global `config :cistern, coerce: <bool>` for this call.
+      Defaults to the global config, or `true` if unset.
+
   ## Examples
 
-      iex> Cistern.set_many([{"foo", "bar"}, {"boo", true}])
+      iex> Cistern.set_many([{"foo", "bar"}, {"boo", "true"}])
       :ok
       iex> Cistern.multiple(["foo", "boo"])
       {:ok, ["bar", true]}
+      iex> Cistern.multiple(["foo", "boo"], coerce: false)
+      {:ok, ["bar", "true"]}
       iex> Cistern.multiple([])
       {:ok, nil}
       iex> Cistern.multiple(["any"])
       {:ok, [nil]}
   """
-  @spec multiple(keys :: [any()]) :: {:ok, nil | [value()]} | {:error, atom() | Redix.Error.t()}
-  def multiple(keys) do
+  @spec multiple(keys :: [any()], opts :: Keyword.t()) ::
+          {:ok, nil | [value()]} | {:error, atom() | Redix.Error.t()}
+  def multiple(keys, opts \\ []) do
     validated_keys = Enum.map(keys, &validate_key/1)
 
     if Enum.empty?(validated_keys) do
@@ -147,7 +167,7 @@ defmodule Cistern do
     else
       ["MGET" | validated_keys]
       |> command()
-      |> translate_many()
+      |> translate_many(opts)
     end
   end
 
@@ -175,8 +195,12 @@ defmodule Cistern do
     key = validate_key(key)
 
     case Keyword.fetch(opts, :ttl) do
-      {:ok, ttl} ->
+      {:ok, ttl} when is_integer(ttl) and ttl > 0 ->
         command(["SET", key, value, "PX", ttl])
+
+      {:ok, ttl} ->
+        raise ArgumentError,
+              "ttl must be a positive integer (milliseconds), got: #{inspect(ttl)}"
 
       _ ->
         command(["SET", key, value])
@@ -223,27 +247,22 @@ defmodule Cistern do
       iex> Cistern.set_many([])
       :ok
   """
-  @spec set_many(Keyword.t(), opts :: Keyword.t()) :: :ok
+  @spec set_many(Keyword.t(), opts :: Keyword.t()) :: :ok | {:error, term()}
   def set_many(kv_list, opts \\ []) do
-    %{kv: validated_kv_list, keys: validated_keys} =
-      Enum.reduce(kv_list, %{keys: [], kv: []}, fn {key, value}, acc ->
-        validated_key = validate_key(key)
-        kv = [validated_key, value]
+    # Dedup by key with last-write-wins. `Map.new/1` keeps the last value for a
+    # repeated key, and the resulting pairs are flattened once into MSET args.
+    deduped_pairs =
+      kv_list
+      |> Enum.map(fn {key, value} -> {validate_key(key), value} end)
+      |> Map.new()
+      |> Enum.to_list()
 
-        acc
-        |> Map.put(:keys, [validated_key | acc.keys])
-        |> Map.put(:kv, [kv | acc.kv])
-      end)
+    flattened_kv_list = Enum.flat_map(deduped_pairs, fn {key, value} -> [key, value] end)
+    validated_keys = Enum.map(deduped_pairs, fn {key, _value} -> key end)
 
-    flattened_kv_list =
-      validated_kv_list
-      |> Enum.uniq()
-      |> List.flatten()
-
-    do_set_many(flattened_kv_list)
-
-    maybe_set_ttl(validated_keys, opts)
-    :ok
+    with :ok <- do_set_many(flattened_kv_list) do
+      maybe_set_ttl(validated_keys, opts)
+    end
   end
 
   @doc """
@@ -363,9 +382,10 @@ defmodule Cistern do
   defp do_set_many([]), do: :ok
 
   defp do_set_many(flattened_kv_list) do
-    {:ok, _} =
-      ["MSET" | flattened_kv_list]
-      |> command()
+    case command(["MSET" | flattened_kv_list]) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp maybe_set_ttl([], _opts), do: :ok
@@ -379,8 +399,10 @@ defmodule Cistern do
           ["PEXPIRE", validated_key, ttl]
         end)
         |> pipeline()
-
-        :ok
+        |> case do
+          {:ok, _results} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
 
       _ ->
         :ok
@@ -403,21 +425,32 @@ defmodule Cistern do
   defp validate_key(key) when is_binary(key), do: key
 
   defp validate_key(key) when is_list(key) do
-    key
-    |> Enum.filter(&is_binary/1)
-    |> IO.iodata_to_binary()
+    # Stringify every element (not just binaries) so integers and other terms
+    # are preserved. Filtering them out would silently drop parts of the key
+    # (e.g. `["prefix:", 42]` -> `"prefix:"`), causing key collisions.
+    Enum.map_join(key, "", &to_string/1)
   end
 
   defp validate_key(key), do: to_string(key)
 
-  defp translate({:ok, value}), do: {:ok, do_translate(value)}
-  defp translate(result), do: result
+  defp translate({:ok, value}, opts), do: {:ok, maybe_translate(value, opts)}
+  defp translate(result, _opts), do: result
 
-  defp translate_many({:ok, list}) do
-    {:ok, Enum.map(list, &do_translate/1)}
+  defp maybe_translate(value, opts) do
+    coerce? = Keyword.get(opts, :coerce, Application.get_env(:cistern, :coerce, true))
+
+    if coerce? do
+      do_translate(value)
+    else
+      value
+    end
   end
 
-  defp translate_many(any), do: any
+  defp translate_many({:ok, list}, opts) do
+    {:ok, Enum.map(list, &maybe_translate(&1, opts))}
+  end
+
+  defp translate_many(any, _opts), do: any
 
   defp do_translate("true"), do: true
   defp do_translate("false"), do: false

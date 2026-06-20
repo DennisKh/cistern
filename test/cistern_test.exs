@@ -4,6 +4,12 @@ defmodule CisternTest do
   doctest Cistern
 
   setup do
+    # Reset mock state between tests so leaked keys can't mask bugs.
+    RedixMock.reset()
+    Application.delete_env(:cistern, :mock_pipeline_error)
+
+    on_exit(fn -> Application.delete_env(:cistern, :mock_pipeline_error) end)
+
     %{
       key: Enum.random(1_000..2_000) |> to_string(),
       value: Enum.random(3_000..4_000)
@@ -48,6 +54,28 @@ defmodule CisternTest do
     assert {:ok, [^value_1, nil]} = Cistern.multiple(["key_3", "key_4"])
   end
 
+  test "multiple/2 with coerce: false returns raw strings", %{key: key} do
+    assert {:ok, _} = Cistern.set(key, "01001")
+
+    assert {:ok, [1001]} = Cistern.multiple([key])
+    assert {:ok, ["01001"]} = Cistern.multiple([key], coerce: false)
+  end
+
+  test "coerce is configurable globally and overridable per call", %{key: key} do
+    Application.put_env(:cistern, :coerce, false)
+    on_exit(fn -> Application.delete_env(:cistern, :coerce) end)
+
+    assert {:ok, _} = Cistern.set(key, "01001")
+
+    # Global config disables coercion...
+    assert {:ok, "01001"} = Cistern.get(key)
+    assert {:ok, ["01001"]} = Cistern.multiple([key])
+
+    # ...but a per-call opt still wins.
+    assert {:ok, 1001} = Cistern.get(key, coerce: true)
+    assert {:ok, [1001]} = Cistern.multiple([key], coerce: true)
+  end
+
   test "increment/1 increments the number stored at key by one", %{key: key} do
     assert {:ok, _value} = Cistern.set(key, 1)
     assert {:ok, 2} = Cistern.increment(key)
@@ -90,6 +118,48 @@ defmodule CisternTest do
     assert {:ok, ^value} = Cistern.get(key)
     assert {:ok, 1} = Cistern.delete(key)
     assert {:ok, nil} = Cistern.get(key)
+  end
+
+  test "validate_key preserves integer elements in an iodata key (bug 1)", %{value: value} do
+    # A distinct id must yield a distinct key. On the old code the integer was
+    # filtered out, so both keys collapsed to "user:" and collided.
+    key_1 = ["user:", 1]
+    key_2 = ["user:", 2]
+
+    assert {:ok, ^value} = Cistern.set(key_1, value)
+    assert {:ok, "other"} = Cistern.set(key_2, "other")
+
+    assert {:ok, ^value} = Cistern.get(key_1)
+    assert {:ok, "other"} = Cistern.get(key_2)
+  end
+
+  test "set_many/2 dedups duplicate keys with last-write-wins (bug 2)" do
+    assert :ok = Cistern.set_many([{"dup", 1}, {"b", 2}, {"dup", 3}])
+
+    # Last write for "dup" wins; "b" is untouched. On the old code the reversed,
+    # non-deduped MSET produced a malformed command and the wrong final value.
+    assert {:ok, 3} = Cistern.get("dup")
+    assert {:ok, 2} = Cistern.get("b")
+  end
+
+  test "set_many/2 surfaces a TTL pipeline failure (bug 3)" do
+    Application.put_env(:cistern, :mock_pipeline_error, %Redix.Error{message: "boom"})
+
+    assert {:error, %Redix.Error{message: "boom"}} =
+             Cistern.set_many([{"k1", 1}, {"k2", 2}], ttl: 1_000)
+  end
+
+  test "get/2 with coerce: false returns the raw string", %{key: key} do
+    assert {:ok, _} = Cistern.set(key, "01001")
+
+    assert {:ok, 1001} = Cistern.get(key)
+    assert {:ok, "01001"} = Cistern.get(key, coerce: false)
+  end
+
+  test "set/3 raises on a non-positive-integer ttl", %{key: key, value: value} do
+    assert_raise ArgumentError, fn -> Cistern.set(key, value, ttl: "1000") end
+    assert_raise ArgumentError, fn -> Cistern.set(key, value, ttl: 0) end
+    assert_raise ArgumentError, fn -> Cistern.set(key, value, ttl: 1.5) end
   end
 
   test "command/1 executes a Redis command and returns a result" do
