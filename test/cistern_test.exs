@@ -54,6 +54,28 @@ defmodule CisternTest do
     assert {:ok, [^value_1, nil]} = Cistern.multiple(["key_3", "key_4"])
   end
 
+  test "multiple/2 with coerce: false returns raw strings", %{key: key} do
+    assert {:ok, _} = Cistern.set(key, "01001")
+
+    assert {:ok, [1001]} = Cistern.multiple([key])
+    assert {:ok, ["01001"]} = Cistern.multiple([key], coerce: false)
+  end
+
+  test "coerce is configurable globally and overridable per call", %{key: key} do
+    Application.put_env(:cistern, :coerce, false)
+    on_exit(fn -> Application.delete_env(:cistern, :coerce) end)
+
+    assert {:ok, _} = Cistern.set(key, "01001")
+
+    # Global config disables coercion...
+    assert {:ok, "01001"} = Cistern.get(key)
+    assert {:ok, ["01001"]} = Cistern.multiple([key])
+
+    # ...but a per-call opt still wins.
+    assert {:ok, 1001} = Cistern.get(key, coerce: true)
+    assert {:ok, [1001]} = Cistern.multiple([key], coerce: true)
+  end
+
   test "increment/1 increments the number stored at key by one", %{key: key} do
     assert {:ok, _value} = Cistern.set(key, 1)
     assert {:ok, 2} = Cistern.increment(key)

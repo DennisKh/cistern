@@ -11,7 +11,6 @@ defmodule Cistern.Redis.Client do
   end
 
   @impl true
-  @spec init(opts :: keyword()) :: {:ok, pid()} | {:error, term()} | :ignore
   def init(_opts) do
     config = Application.get_all_env(:cistern)
     host = Keyword.fetch!(config, :host)
@@ -21,15 +20,13 @@ defmodule Cistern.Redis.Client do
     config =
       config
       |> filter_empty()
-      |> drop_pool_configs()
+      |> drop_internal_configs()
 
     @redis_module.start_link(config)
   end
 
   @doc false
   @impl true
-  @spec handle_call({atom(), list(), keyword()}, GenServer.from(), conn :: term()) ::
-          {:reply, term(), term()}
   def handle_call({command, args, opts}, _from, conn)
       when command in [:command, :pipeline, :noreply_pipeline] do
     if Application.get_env(:cistern, :debug_commands, false) do
@@ -47,7 +44,7 @@ defmodule Cistern.Redis.Client do
     end)
   end
 
-  defp drop_pool_configs(configs) do
-    Keyword.drop(configs, [:pool_size, :pool_max_overflow, :pool_timeout])
+  defp drop_internal_configs(configs) do
+    Keyword.drop(configs, [:pool_size, :pool_max_overflow, :pool_timeout, :coerce])
   end
 end

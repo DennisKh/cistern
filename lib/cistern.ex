@@ -25,7 +25,8 @@ defmodule Cistern do
         pool_max_overflow: 5,   # extra connections allowed under load
         pool_timeout: 5_000,    # ms to wait for a free connection
         sync_connect: true,
-        exit_on_disconnection: true
+        exit_on_disconnection: true,
+        coerce: true            # global read coercion; override per call with `coerce:`
 
   ## Starting under a supervision tree
 
@@ -105,7 +106,8 @@ defmodule Cistern do
 
     * `:coerce` - When `false`, the raw string is returned without type
       coercion (e.g. `"01001"` stays `"01001"` instead of becoming `1001`).
-      Defaults to `true` for backward compatibility.
+      Overrides the global `config :cistern, coerce: <bool>` for this call.
+      Defaults to the global config, or `true` if unset.
 
   ## Examples
 
@@ -135,19 +137,29 @@ defmodule Cistern do
   Returns multiple cached values by a list of keys. For every key that does not hold a string value
   or does not exist,the special value `nil` is returned.
 
+  ## Options
+
+    * `:coerce` - When `false`, each raw string is returned without type
+      coercion (e.g. `"01001"` stays `"01001"` instead of becoming `1001`).
+      Overrides the global `config :cistern, coerce: <bool>` for this call.
+      Defaults to the global config, or `true` if unset.
+
   ## Examples
 
-      iex> Cistern.set_many([{"foo", "bar"}, {"boo", true}])
+      iex> Cistern.set_many([{"foo", "bar"}, {"boo", "true"}])
       :ok
       iex> Cistern.multiple(["foo", "boo"])
       {:ok, ["bar", true]}
+      iex> Cistern.multiple(["foo", "boo"], coerce: false)
+      {:ok, ["bar", "true"]}
       iex> Cistern.multiple([])
       {:ok, nil}
       iex> Cistern.multiple(["any"])
       {:ok, [nil]}
   """
-  @spec multiple(keys :: [any()]) :: {:ok, nil | [value()]} | {:error, atom() | Redix.Error.t()}
-  def multiple(keys) do
+  @spec multiple(keys :: [any()], opts :: Keyword.t()) ::
+          {:ok, nil | [value()]} | {:error, atom() | Redix.Error.t()}
+  def multiple(keys, opts \\ []) do
     validated_keys = Enum.map(keys, &validate_key/1)
 
     if Enum.empty?(validated_keys) do
@@ -155,7 +167,7 @@ defmodule Cistern do
     else
       ["MGET" | validated_keys]
       |> command()
-      |> translate_many()
+      |> translate_many(opts)
     end
   end
 
@@ -425,18 +437,20 @@ defmodule Cistern do
   defp translate(result, _opts), do: result
 
   defp maybe_translate(value, opts) do
-    if Keyword.get(opts, :coerce, true) do
+    coerce? = Keyword.get(opts, :coerce, Application.get_env(:cistern, :coerce, true))
+
+    if coerce? do
       do_translate(value)
     else
       value
     end
   end
 
-  defp translate_many({:ok, list}) do
-    {:ok, Enum.map(list, &do_translate/1)}
+  defp translate_many({:ok, list}, opts) do
+    {:ok, Enum.map(list, &maybe_translate(&1, opts))}
   end
 
-  defp translate_many(any), do: any
+  defp translate_many(any, _opts), do: any
 
   defp do_translate("true"), do: true
   defp do_translate("false"), do: false
