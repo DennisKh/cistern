@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.1](https://github.com/DennisKh/cistern/compare/v0.1.0...v0.1.1) (2026-06-20)
+
+
+### Features
+
+* make read coercion configurable globally and per call ([73d9014](https://github.com/DennisKh/cistern/commit/73d90141d4c95d48c56a5f8d7923d2a448a65cc6))
+
+
+### Bug Fixes
+
+* add hex.pm link to readme ([2d6791f](https://github.com/DennisKh/cistern/commit/2d6791f20295d735df3c28c8d596d13da050aacb))
+* add hex.pm link to readme ([0a3a324](https://github.com/DennisKh/cistern/commit/0a3a3246fc05d1b6f7ad2ce72e5325d45f9c6199))
+* preserve integers in iodata keys and dedup set_many writes ([a86c3a4](https://github.com/DennisKh/cistern/commit/a86c3a49f708f10795a25bce7982cd761b9a5585))
+* preserve integers in iodata keys and dedup set_many writes ([f591b2e](https://github.com/DennisKh/cistern/commit/f591b2eaabdd4aa2a9ef5a9a2533737d429e87a3))
+
 ## [Unreleased] (2026-06-20)
 
 ### Fixed

@@ -4,7 +4,7 @@ defmodule Cistern.MixProject do
   def project do
     [
       app: :cistern,
-      version: "0.1.0",
+      version: "0.1.1",
       elixir: "~> 1.17",
       description:
         "A Redix wrapper with a Poolboy-managed connection pool and typed read helpers.",
