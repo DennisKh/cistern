@@ -49,6 +49,23 @@ config :cistern,
   exit_on_disconnection: true
 ```
 
+### Runtime configuration (production)
+
+For production it's common to read connection settings from environment
+variables at boot via `config/runtime.exs`:
+
+```elixir
+import Config
+
+if config_env() == :prod do
+  config :cistern,
+    host: System.fetch_env!("REDIS_HOST"),
+    port: String.to_integer(System.get_env("REDIS_PORT", "6379")),
+    password: System.get_env("REDIS_PASSWORD", ""),
+    pool_size: String.to_integer(System.get_env("REDIS_POOL_SIZE", "10"))
+end
+```
+
 ## Usage
 
 ### Starting under a Supervision tree
@@ -83,6 +100,9 @@ Or start manually:
 {:ok, 42}     = Cistern.get("count_key")  # stored as "42"
 {:ok, nil}    = Cistern.get("missing")
 
+# Opt out of coercion to keep the raw string (e.g. zero-padded codes)
+{:ok, "01001"} = Cistern.get("zip_key", coerce: false)  # stored as "01001"
+
 # Bulk write
 :ok = Cistern.set_many([{"foo", "bar"}, {"count", 1}])
 :ok = Cistern.set_many([{"a", 1}, {"b", 2}], ttl: 60_000)
@@ -100,10 +120,12 @@ Or start manually:
 
 ### Iodata keys
 
-Keys can be iodata lists — they are joined into a single binary before being sent to Redis:
+Keys can be iodata lists — they are joined into a single binary before being
+sent to Redis. Non-binary elements (e.g. integer ids) are stringified and kept,
+so `["user:", 1]` and `["user:", 2]` produce distinct keys:
 
 ```elixir
-key = ["user:", user_id]
+key = ["user:", user_id]   # user_id may be a binary or an integer
 Cistern.set(key, data)
 Cistern.get(key)
 Cistern.delete(key)
